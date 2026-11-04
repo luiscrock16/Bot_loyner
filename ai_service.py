@@ -3,7 +3,7 @@ from datetime import datetime
 import re
 from typing import Dict, List
 import requests
-from config import GEMINI_API_KEY, GROQ_API_KEY
+from config import GEMINI_API_KEY, GROQ_API_KEY, SYSTEM_PROMPT
 import search_service
 
 USER_HISTORIES: Dict[int, List[Dict[str, str]]] = {}
@@ -34,13 +34,11 @@ def clear_history(user_id: int):
 
 def _call_gemini_rest(api_key: str, prompt_with_context: str, history: List[Dict[str, str]]) -> str:
     fecha_actual = get_current_date_str()
-    system_prompt = (
-        f"Eres un asistente conversacional inteligente, culto y amigable en Telegram, "
-        f"exactamente como hablar con ChatGPT o Gemini en la web. "
-        f"La fecha de hoy es: {fecha_actual}. "
-        f"Respondes en español con un tono cercano, natural y humano. "
-        f"Si se te proporcionan datos recientes de internet, úsalos para redactar una respuesta "
-        f"fluida y conversacional con los hechos más relevantes."
+    full_system_instruction = (
+        f"{SYSTEM_PROMPT}\n"
+        f"La fecha de hoy es: {fecha_actual}.\n"
+        f"Si se te proporcionan datos recientes de internet, utilízalos para responder "
+        f"con precisión y actualidad manteniendo siempre tu estilo y personalidad."
     )
 
     contents = []
@@ -50,7 +48,7 @@ def _call_gemini_rest(api_key: str, prompt_with_context: str, history: List[Dict
     contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
 
     payload = {
-        "system_instruction": {"parts": [{"text": system_prompt}]},
+        "system_instruction": {"parts": [{"text": full_system_instruction}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}
     }
