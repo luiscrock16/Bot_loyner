@@ -1,105 +1,107 @@
 ﻿import asyncio
+from datetime import datetime
+import re
 from typing import Dict, List
 import requests
-from openai import OpenAI
-from config import (
-    GROK_API_KEY,
-    GROQ_API_KEY,
-    GEMINI_API_KEY
-)
+from config import GEMINI_API_KEY, GROQ_API_KEY
 
 USER_HISTORIES: Dict[int, List[Dict[str, str]]] = {}
-MAX_HISTORY_TURNS = 10
+MAX_HISTORY_TURNS = 8
 
-SYSTEM_INSTRUCTION = (
-    "Eres un asistente conversacional inteligente, amigable y cercano en Telegram, "
-    "exactamente como hablar con ChatGPT o Gemini en la web. "
-    "Respondes siempre de forma natural, en español, con explicaciones claras, útiles y humanas. "
-    "Recuerdas el contexto de la charla y te adaptas al tono del usuario."
-)
-
-GEMINI_MODELS = [
-    "gemini-flash-lite-latest",
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-flash-latest"
+PATRONES_BUSQUEDA = [
+    r"\bmañana\b", r"\bhoy\b", r"\bayer\b", r"\bpartido(s)?\b", r"\bf[uú]tbol\b",
+    r"\bresultado(s)?\b", r"\bmarcador(es)?\b", r"\bnoticia(s)?\b", r"\bprecio\b",
+    r"\bclima\b", r"\bcampeonato\b", r"\bchampions\b", r"\bjuego\b", r"\bqui[eé]n gan[oó]\b",
+    r"\b[uú]ltim[oa]s?\b", r"\bcelebra\b", r"\befem[eé]ride(s)?\b", r"\bferiado\b"
 ]
+
+def needs_internet_data(prompt: str) -> bool:
+    p_lower = prompt.lower()
+    for pattern in PATRONES_BUSQUEDA:
+        if re.search(pattern, p_lower):
+            return True
+    return False
+
+def get_current_date_str() -> str:
+    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    now = datetime.now()
+    dia_semana = dias[now.weekday()]
+    mes = meses[now.month - 1]
+    return f"{dia_semana}, {now.day} de {mes} de {now.year}"
 
 def clear_history(user_id: int):
     USER_HISTORIES[user_id] = []
 
-def _call_gemini_rest(api_key: str, prompt: str, history: List[Dict[str, str]]) -> str:
-    """Llama a la API REST de Google Gemini probando los modelos de alta disponibilidad."""
+def _call_gemini_rest(api_key: str, prompt_with_context: str, history: List[Dict[str, str]]) -> str:
+    fecha_actual = get_current_date_str()
+    system_prompt = (
+        f"Eres un asistente conversacional inteligente, culto y amigable en Telegram, "
+        f"exactamente como hablar con ChatGPT o Gemini en la web. "
+        f"La fecha de hoy es: {fecha_actual}. "
+        f"Respondes en español con un tono cercano, natural y humano. "
+        f"Si se te proporcionan datos de internet, úsalos para responder con precisión y frescura "
+        f"redactando tú mismo la respuesta como un asistente experto."
+    )
+
     contents = []
     for h in history[-MAX_HISTORY_TURNS:]:
         role = "user" if h["role"] == "user" else "model"
         contents.append({"role": role, "parts": [{"text": h["text"]}]})
-    contents.append({"role": "user", "parts": [{"text": prompt}]})
+    contents.append({"role": "user", "parts": [{"text": prompt_with_context}]})
 
     payload = {
-        "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+        "system_instruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024}
     }
 
-    last_error = None
-    for model_name in GEMINI_MODELS:
+    models = ["gemini-flash-lite-latest", "gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    last_err = None
+
+    for model_name in models:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
         try:
             r = requests.post(url, json=payload, timeout=12)
             if r.status_code == 200:
                 data = r.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return text.strip()
-            elif r.status_code == 503:
-                last_error = "503 Saturado"
-                continue
-            else:
-                last_error = f"{r.status_code}: {r.text[:100]}"
-                continue
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            last_err = f"{r.status_code}: {r.text[:80]}"
         except Exception as e:
-            last_error = str(e)
+            last_err = str(e)
             continue
 
-    raise RuntimeError(f"No se pudo conectar a los servidores de Gemini: {last_error}")
-
-def _call_openai_compatible(api_key: str, base_url: str, model: str, messages: List[Dict[str, str]]) -> str:
-    client = OpenAI(api_key=api_key, base_url=base_url, timeout=12.0)
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=0.7
-    )
-    return response.choices[0].message.content.strip()
+    raise RuntimeError(last_err)
 
 async def ask_chatbot(user_id: int, prompt: str) -> str:
     history = USER_HISTORIES.setdefault(user_id, [])
 
-    # 1. GROQ (Si está configurado y accesible)
-    if GROQ_API_KEY:
+    # Verificar si conviene consultar datos de internet
+    prompt_to_send = prompt
+    if needs_internet_data(prompt):
         try:
-            messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
-            for h in history[-MAX_HISTORY_TURNS:]:
-                messages.append({"role": "assistant" if h["role"] == "model" else "user", "content": h["text"]})
-            messages.append({"role": "user", "content": prompt})
-            reply = await asyncio.to_thread(_call_openai_compatible, GROQ_API_KEY, "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile", messages)
-            history.append({"role": "user", "text": prompt})
-            history.append({"role": "model", "text": reply})
-            USER_HISTORIES[user_id] = history[-MAX_HISTORY_TURNS * 2:]
-            return reply
+            import search_service
+            # Formatear una query adecuada
+            fecha = get_current_date_str()
+            query = f"{prompt} {fecha}" if "celebra" in prompt or "partido" in prompt else prompt
+            web_items = await asyncio.to_thread(search_service.search_web, query, 3)
+            if web_items:
+                snippets = "\n".join([f"- {it['title']}: {it['body']}" for it in web_items])
+                prompt_to_send = f"{prompt}\n\n[Información reciente de internet para fundamentar tu respuesta]:\n{snippets}"
         except Exception as e:
-            print(f"Fallo Groq: {e}. Probando Gemini...")
+            print(f"Error trayendo datos de búsqueda: {e}")
 
-    # 2. GOOGLE GEMINI (Modelos de alta disponibilidad sin 503)
+    # Consultar modelo de lenguaje (Gemini)
     if GEMINI_API_KEY:
         try:
-            reply = await asyncio.to_thread(_call_gemini_rest, GEMINI_API_KEY, prompt, history)
+            reply = await asyncio.to_thread(_call_gemini_rest, GEMINI_API_KEY, prompt_to_send, history)
+            # Guardamos en la memoria el prompt original del usuario (sin los datos inyectados)
             history.append({"role": "user", "text": prompt})
             history.append({"role": "model", "text": reply})
             USER_HISTORIES[user_id] = history[-MAX_HISTORY_TURNS * 2:]
             return reply
         except Exception as e:
-            print(f"Error en Gemini REST: {e}")
-            return f"Lo siento, ocurrió un detalle al conectar con la IA: {e}"
+            print(f"Error generando con Gemini: {e}")
+            return f"Lo siento, ocurrió un inconveniente con el servidor de IA: {e}"
 
-    return "No hay ninguna clave de IA configurada en el bot."
+    return "No hay clave de IA configurada en el bot."
