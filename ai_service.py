@@ -34,25 +34,26 @@ def get_diagnostics() -> Dict[str, str]:
 
 def _call_grok(api_key: str, messages: List[Dict[str, str]]) -> str:
     client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1", timeout=15.0)
-    # Intentar con grok-beta o grok-2
-    models_to_try = ["grok-beta", "grok-2", "grok-2-latest"]
+    # Modelos oficiales actuales de xAI (grok-2-latest primero)
+    models_to_try = ["grok-2-latest", "grok-2", "grok-2-1212"]
     last_err = None
+
     for m in models_to_try:
         try:
             response = client.chat.completions.create(
                 model=m,
                 messages=messages,
-                temperature=0.7,
-                max_tokens=1024
+                temperature=0.7
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
-            # Si el modelo no existe, probar el siguiente
-            if "model" in str(e).lower() or "not found" in str(e).lower():
-                continue
-            raise e
-    raise last_err
+            continue
+
+    # Si ninguno respondió, obtener detalles del error
+    err_body = getattr(last_err, "body", None)
+    err_msg = err_body if err_body else str(last_err)
+    raise RuntimeError(f"Error xAI: {err_msg}")
 
 def _call_gemini(api_key: str, model: str, prompt: str, history: List[Dict[str, str]]) -> str:
     from google import genai
@@ -90,7 +91,7 @@ async def ask_chatbot(user_id: int, prompt: str) -> str:
         messages.append({"role": role, "content": h["text"]})
     messages.append({"role": "user", "content": prompt})
 
-    # 1. xAI GROK
+    # 1. Intentar xAI GROK
     if GROK_API_KEY:
         try:
             reply = await asyncio.to_thread(_call_grok, GROK_API_KEY, messages)
@@ -99,30 +100,32 @@ async def ask_chatbot(user_id: int, prompt: str) -> str:
             USER_HISTORIES[user_id] = history[-MAX_HISTORY_TURNS * 2:]
             return reply
         except Exception as e:
-            err_str = str(e)
-            print(f"Error llamando a xAI Grok: {err_str}")
-            return f"⚠️ Error al conectar con xAI Grok: {err_str}\n\nRevisa si la clave tiene créditos activos o permisos en https://console.x.ai/"
+            print(f"Fallo xAI Grok: {e}. Intentando proveedor de respaldo...")
 
-    # 2. GOOGLE GEMINI (Si no hay Grok o falla)
+    # 2. Respaldo: GOOGLE GEMINI (Si Grok falla o no está)
     if GEMINI_API_KEY:
         try:
-            reply = await asyncio.to_thread(_call_gemini, GEMINI_API_KEY, "gemini-3.8-flash", prompt, history)
-            history.append({"role": "user", "text": prompt})
-            history.append({"role": "model", "text": reply})
-            USER_HISTORIES[user_id] = history[-MAX_HISTORY_TURNS * 2:]
-            return reply
+            # Probar gemini-2.5-flash o gemini-3.8-flash
+            for g_model in ["gemini-2.5-flash", "gemini-3.8-flash"]:
+                try:
+                    reply = await asyncio.to_thread(_call_gemini, GEMINI_API_KEY, g_model, prompt, history)
+                    history.append({"role": "user", "text": prompt})
+                    history.append({"role": "model", "text": reply})
+                    USER_HISTORIES[user_id] = history[-MAX_HISTORY_TURNS * 2:]
+                    return reply
+                except Exception as ge:
+                    print(f"Fallo con {g_model}: {ge}")
+                    continue
         except Exception as e:
-            err_str = str(e)
-            if "503" in err_str or "UNAVAILABLE" in err_str or "high demand" in err_str:
-                return (
-                    "⚠️ Los servidores de Google Gemini están temporalmente saturados (Error 503).\n\n"
-                    "👉 Asegúrate de agregar la clave de Grok en Render en la pestaña 'Environment' con el nombre exacto: `GROK_API_KEY`."
-                )
-            return f"Error en Gemini: {e}"
+            print(f"Error general en Gemini: {e}")
 
-    # Si no hay ninguna clave detectada en el entorno
+    # 3. Respaldo: Búsqueda web directa
+    results = search_service.search_web(prompt, max_results=3)
+    if results:
+        return search_service.format_search_summary(prompt, results)
+
     return (
-        "🤖 No se detectó ninguna API Key en las variables de entorno de Render.\n\n"
-        "Ve a Render > Environment y agrega:\n"
-        "`GROK_API_KEY` con tu clave de xAI."
+        "⚠️ Hubo un problema al consultar la IA:\n"
+        "• xAI Grok rechazó la llamada (verifica si tienes créditos activos en https://console.x.ai/).\n"
+        "• Puedes también agregar tu clave gratuita de Groq (https://console.groq.com/keys) como `GROQ_API_KEY`."
     )
